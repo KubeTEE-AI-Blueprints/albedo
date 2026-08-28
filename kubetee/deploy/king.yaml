@@ -9,7 +9,14 @@
 # Challenger Jobs set:
 #   ALBEDO_REMOTE_KING_BASE_URL=http://albedo-king.albedo-poc.svc.cluster.local:8000
 #
-# GPU cut: 4 GPUs / TP=4 on am-h200-25.
+# CC (2026-08-11): Kata TDX + Hopper PPCIE on am-h200-25.
+#   runtimeClassName: kata-qemu-nvidia-gpu-tdx-runtime-rs
+#   8× GH100_H200 + 4× nvswitch (nvswitch required for PPCIE attestation / CUDA 802;
+#   taking all 4 NVSwitches exclusive-locks the node, so use all 8 GPUs / TP=8)
+#   limits.cpu=16 → runtime-rs static sandbox sizing (vm_vcpus ≈ 17)
+#   imagePullPolicy: IfNotPresent (guest has no registry egress)
+#   Model cache stays longhorn-v2 RWX (virtio-fs into guest). Prefill HF weights
+#   on the PVC before first CC boot — guest cannot pull from Hugging Face.
 #
 # To mark a king change (in-flight challengers get 503 king_changing):
 #   kubectl -n albedo-poc exec deploy/albedo-king -c king-api -- \
@@ -37,7 +44,7 @@ data:
   KING_HF_REVISION: "1ba87c52697f154a8f75a33ddf5714c1d314bcc7"
   # OpenAI model id returned by vLLM / used by HttpOpenAIGenerator.
   KING_OPENAI_MODEL: "bkn1890/albedo-qwen3.6-35b-hk971"
-  KING_TENSOR_PARALLEL_SIZE: "4"
+  KING_TENSOR_PARALLEL_SIZE: "8"
   KING_GPU_MEMORY_UTILIZATION: "0.95"
   KING_MAX_MODEL_LEN: "32768"
 ---
@@ -259,14 +266,20 @@ spec:
       labels:
         app.kubernetes.io/name: albedo-king
         app.kubernetes.io/part-of: kubetee-sn97-poc
+      annotations:
+        # vCPU via limits.cpu on the vllm container (fidencio / kata#13440).
+        # runtime-rs: vm_vcpus = sum(limits.cpu) + overhead_vcpus(0.5).
+        # CC attestation / KBS guest image pull — DISABLED until Trustee/KBS is up:
+        # io.katacontainers.config.hypervisor.kernel_params: "agent.image_registry_auth=kbs:///default/nvcr-credentials/nvcr-auth.json agent.aa_kbc_params=cc_kbc::http://kbs-service.trustee-operator-system.svc.cluster.local:8080 agent.image_pull_timeout=7200"
     spec:
-      runtimeClassName: nvidia
+      runtimeClassName: kata-qemu-nvidia-gpu-tdx-runtime-rs
       nodeSelector:
         kubetee.ai/albedo-king: "true"
       containers:
         - name: vllm
           image: vllm/vllm-openai:v0.23.0
-          imagePullPolicy: Always
+          # Guest has no registry egress — host/nydus must already have the image.
+          imagePullPolicy: IfNotPresent
           command:
             - bash
             - -c
@@ -295,12 +308,15 @@ spec:
                 name: albedo-poc-secrets
           resources:
             limits:
-              nvidia.com/gpu: "4"
-              cpu: "32"
+              # Hopper PPCIE CC: full HGX slice + NVSwitches (attestation / CUDA 802).
+              nvidia.com/GH100_H200_SXM_141GB: "8"
+              nvidia.com/nvswitch: "4"
+              cpu: "16"
               memory: "256Gi"
             requests:
-              nvidia.com/gpu: "4"
-              cpu: "32"
+              nvidia.com/GH100_H200_SXM_141GB: "8"
+              nvidia.com/nvswitch: "4"
+              cpu: "16"
               memory: "256Gi"
           volumeMounts:
             - name: model-cache
@@ -326,8 +342,8 @@ spec:
           ports:
             - name: http
               containerPort: 8000
-          # king-api waits for local vLLM (weight load can take 10–30+ min) before
-          # binding :8000. Without a long startupProbe, liveness SIGKILLs it (exit 137).
+          # king-api binds :8000 immediately; /ready stays 503 until vLLM is up.
+          # CC sandbox + weight load can take 10–40+ min — keep long startupProbe.
           startupProbe:
             httpGet:
               path: /health
@@ -351,7 +367,7 @@ spec:
             failureThreshold: 6
           resources:
             limits:
-              cpu: "2"
+              cpu: "1"
               memory: "2Gi"
             requests:
               cpu: "500m"
